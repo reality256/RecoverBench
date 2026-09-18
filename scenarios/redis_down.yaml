@@ -1,0 +1,18 @@
+id: redis_down_001
+
+description: >
+  Redis becomes unavailable while
+  the API service is running.
+
+fault:
+  type: service_down
+  target: redis
+
+expected:
+  root_cause: redis_unavailable
+
+success:
+  api_health: healthy
+  redis_health: healthy
+
+timeout_seconds: 120
