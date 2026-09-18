@@ -22,7 +22,7 @@ venv/
 Thumbs.db
 .DS_Store
 
-# ===== 个人学习材料=====
-docs/
-steps.md
-log.md
+# ===== 运行轨迹(每次运行生成,不入库)=====
+runs/
+
+

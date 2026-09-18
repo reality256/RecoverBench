@@ -1,108 +1,123 @@
-"""无 LLM 的确定性 Agent 循环(V0)。
+"""命令行入口:选策略 → 建预算 → 跑公共循环 → 写运行轨迹 → 打印结论与退出码。
 
-流程(见 steps.md Step 7):
-    观察 API
-      ├─ 健康 ──────────────▶ ALREADY_HEALTHY(退出码 0)
-      └─ 不健康
-           ↓
-    查看 Redis 状态和最近日志
-           ↓
-     Redis 在运行? ──是──▶ UNRESOLVED(退出码 1)
-           │否
-           ↓
-     启动 Redis(整个循环只允许这一次修复动作)
-           ↓
-     等待并验证(最多 5 次,每次间隔 1 秒)
-      ├─ 健康 ──────────────▶ RECOVERED(退出码 0)
-      └─ 仍不健康 ──────────▶ FAILED(退出码 1)
+用法:
+    python agent/agent.py                  # 规则策略(不需要 API key)
+    python agent/agent.py --policy llm     # 模型策略(需要 .env 里的 API key)
 
-约束:
-- 只在证据表明 Redis 未运行时才启动它。
-- 不使用 scripts/reset_env.py,不调用 evaluator —— Agent 和裁判必须相互独立。
-- 退出码:0 = 已健康/恢复成功,1 = 诊断后仍无法恢复,2 = Agent 自身工具调用出错。
+退出码:
+    0 = 已健康或恢复成功
+    1 = 诊断后仍无法恢复
+    2 = Agent 自身出错(工具调用失败、超出预算、配置错误)
+
+注意:退出码反映的是 Agent 自己的结论(模型策略下即模型的判断)。
+真正的 ground truth 是裁判(evaluator)的判定,两者都记在 runs/<id>/result.json 里。
 """
 
+import argparse
 import sys
-import time
 from pathlib import Path
 
 # 保证无论从哪个目录、以哪种方式启动,都能 import 到 agent 包
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent import tools  # noqa: E402
-from agent.state import ApiHealth  # noqa: E402
+from agent.budget import Budget  # noqa: E402
+from agent.config import AppConfig  # noqa: E402
+from agent.loop import run_loop  # noqa: E402
+from agent.policies.rule import RulePolicy  # noqa: E402
+from agent.trace import RunRecorder  # noqa: E402
 
-# 退出码
-EXIT_OK = 0            # 已健康或恢复成功
-EXIT_UNRESOLVED = 1    # 诊断后仍无法恢复
-EXIT_AGENT_ERROR = 2   # Agent 自身配置或工具调用出错
+# 结论 → (展示名, 退出码)
+CONCLUSION_LABELS = {
+    "healthy": "ALREADY_HEALTHY",
+    "recovered": "RECOVERED",
+    "unresolved": "UNRESOLVED",
+    "failed": "FAILED",
+    "budget_exceeded": "BUDGET_EXCEEDED",
+    "agent_error": "AGENT_ERROR",
+}
 
-# 修复后最多验证 5 次,每次间隔 1 秒
-MAX_VERIFY_ATTEMPTS = 5
-VERIFY_INTERVAL_SECONDS = 1
+EXIT_CODES = {
+    "healthy": 0,
+    "recovered": 0,
+    "unresolved": 1,
+    "failed": 1,
+    "budget_exceeded": 2,
+    "agent_error": 2,
+}
 
 
-def _is_healthy(health: ApiHealth) -> bool:
-    """API 完全健康 = 请求成功且 status、redis 都是 healthy。"""
-    return health.ok and health.status == "healthy" and health.redis == "healthy"
+def build_policy(name: str, budget: Budget, recorder: RunRecorder, task: str = None):
+    """按名字构造策略,并返回 (policy, 用于 config.json 的元信息)。"""
+    if name == "rule":
+        policy = RulePolicy()
+        return policy, {
+            "policy": type(policy).__name__,
+            "policy_version": "rule-v1",
+            "model": None,
+            "prompt_version": None,
+            "llm": None,
+        }
 
+    # llm
+    from agent.llm_client import LlmClient
+    from agent.policies.llm import DEFAULT_TASK, LlmPolicy, prompt_version
 
-def run_agent() -> int:
-    """执行一次 观察→诊断→行动→验证 闭环,返回退出码。"""
-    step = 0
+    config = AppConfig.from_env()
+    if not config.has_api_key:
+        print("缺少 API key:请在项目根目录的 .env 里设置 LLM_API_KEY(可参考 .env.example)")
+        print("退出码: 2")
+        sys.exit(2)
 
-    # ---- 观察 1:API 健康吗 ----
-    step += 1
-    health = tools.get_api_health()
-    print(f"[{step}] get_api_health → {health}")
-    if _is_healthy(health):
-        print("结论: ALREADY_HEALTHY")
-        return EXIT_OK
-
-    # ---- 观察 2:Redis 状态和最近日志 ----
-    step += 1
-    redis_status = tools.get_service_status("redis")
-    print(f"[{step}] get_service_status(redis) → {redis_status}")
-    if redis_status.error:
-        print("结论: AGENT_ERROR(查不到 Redis 状态,Docker 可能不可用)")
-        return EXIT_AGENT_ERROR
-
-    logs = tools.get_service_logs("redis", tail=20)
-    if logs.ok and logs.output:
-        print(f"[{step}] get_service_logs(redis, 20) → {logs.output[-300:]}")
-    elif not logs.ok:
-        print(f"[{step}] get_service_logs(redis, 20) → 查询失败: {logs.error}")
-
-    # ---- 决策(V0 规则):只有证据表明 Redis 未运行时才动手 ----
-    if redis_status.running:
-        print("结论: UNRESOLVED(Redis 在运行,故障另有原因,超出 V0 能力范围)")
-        return EXIT_UNRESOLVED
-
-    # ---- 行动:启动 Redis(整个循环中唯一一次修复动作) ----
-    step += 1
-    result = tools.restart_service("redis")
-    print(f"[{step}] restart_service(redis) → {result}")
-    if not result.ok:
-        print("结论: AGENT_ERROR(修复动作执行失败)")
-        return EXIT_AGENT_ERROR
-
-    # ---- 验证:等待并重复验证,最多 5 次 ----
-    for attempt in range(1, MAX_VERIFY_ATTEMPTS + 1):
-        time.sleep(VERIFY_INTERVAL_SECONDS)
-        health = tools.get_api_health()
-        print(f"[验证 {attempt}/{MAX_VERIFY_ATTEMPTS}] → status={health.status}, redis={health.redis}")
-        if _is_healthy(health):
-            print("结论: RECOVERED")
-            return EXIT_OK
-
-    print(f"结论: FAILED(验证 {MAX_VERIFY_ATTEMPTS} 次仍未恢复)")
-    return EXIT_UNRESOLVED
+    task_text = task or DEFAULT_TASK
+    client = LlmClient(config)
+    policy = LlmPolicy(client, budget=budget, recorder=recorder, task=task_text, config=config)
+    return policy, {
+        "policy": type(policy).__name__,
+        "policy_version": prompt_version(task_text),
+        "model": config.model,
+        "prompt_version": prompt_version(task_text),
+        "llm": config.redacted(),
+    }
 
 
 def main() -> None:
-    code = run_agent()
-    print(f"\n退出码: {code}")
-    sys.exit(code)
+    parser = argparse.ArgumentParser(description="RecoverBench Agent")
+    parser.add_argument("--policy", choices=["rule", "llm"], default="rule",
+                        help="决策策略:rule(默认,确定性规则)或 llm(模型)")
+    parser.add_argument("--task", default=None, help="覆盖默认任务描述(正常/故障场景应使用同一段)")
+    parser.add_argument("--run-id", default=None, help="指定轨迹目录名(实验 runner 用来归档每轮)")
+    parser.add_argument("--runs-root", default=None, help="轨迹根目录(默认 runs/)")
+    args = parser.parse_args()
+
+    budget = Budget()
+    recorder = RunRecorder(run_id=args.run_id, runs_root=Path(args.runs_root) if args.runs_root else None)
+    policy, meta = build_policy(args.policy, budget, recorder, args.task)
+
+    recorder.write_config(budget=budget.snapshot(), task=args.task, **meta)
+
+    finish, history = run_loop(policy, tools.TOOL_REGISTRY, budget=budget, recorder=recorder)
+
+    label = CONCLUSION_LABELS.get(finish.conclusion, finish.conclusion.upper())
+    exit_code = EXIT_CODES.get(finish.conclusion, 2)
+
+    recorder.write_result(
+        conclusion=finish.conclusion,
+        label=label,
+        evidence=finish.evidence,
+        exit_code=exit_code,
+        steps=len(history),
+        budget=budget.snapshot(),
+        tools_used=[entry.decision.name for entry in history],
+        error=finish.evidence if finish.conclusion in ("agent_error", "budget_exceeded") else None,
+    )
+
+    print(f"结论: {label}" if not finish.evidence else f"结论: {label}({finish.evidence})")
+    print(f"运行记录: {recorder.run_dir}")
+    print("\n提示:这是 Agent 自己的结论;最终以裁判为准 ——")
+    print(f"      python evaluator/evaluate.py --attach {recorder.run_dir}")
+    print(f"\n退出码: {exit_code}")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

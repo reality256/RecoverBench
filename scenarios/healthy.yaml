@@ -1,0 +1,14 @@
+id: healthy_001
+
+description: >
+  正常对照场景:不注入任何故障,
+  用于验证 Agent 在健康环境下"检查后即结束、不做多余修改"。
+
+fault:
+  type: none
+
+success:
+  api_health: healthy
+  redis_health: healthy
+
+timeout_seconds: 120

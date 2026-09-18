@@ -1,62 +1,45 @@
-"""Agent 的结构化状态定义。
+"""Agent 的状态、决策与历史类型(V1)。
 
-原则:Agent 的所有观察结果都用 dataclass 表达,不用随意拼接的字符串。
-网络失败、命令超时等都通过返回值里的 ok/error 字段表达,而不是抛异常让程序崩溃。
+V1 起,工具返回值统一为可序列化 dict(见 tools.py 的约定):
+    {"ok": bool, "data": dict | None, "error": str | None}
+其中 ok=True 只表示"查询/动作成功",不表示系统健康。
+
+这里的类型只服务于循环和策略:决策(Decision)、历史(HistoryEntry)。
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Union
 
 
 @dataclass
-class ApiHealth:
-    """API 健康状态的观察结果。
+class ToolCall:
+    """调用一个工具。"""
+    name: str
+    args: Dict[str, object] = field(default_factory=dict)
+    # 执行前等待秒数(策略用它控制节奏,如验证间隔;V0 规则策略使用)
+    wait_seconds: float = 0.0
+    # 决策者的一句话说明(模型策略填模型可见输出,规则策略留空);只记摘要,不进"思考过程"
+    note: str = ""
 
-    ok     : API 是否可访问(请求成功并解析出 JSON)
-    status : /health 返回的 status 字段(healthy / degraded)
-    redis  : /health 返回的 redis 字段(healthy / unavailable)
-    error  : 请求失败(网络错误、超时、JSON 解析失败等)时的错误信息
+
+@dataclass
+class Finish:
+    """结束循环。
+
+    conclusion 取值:healthy / recovered / unresolved / failed / agent_error
+    evidence    :一句话说明依据(供复盘)。
     """
-    ok: bool
-    status: Optional[str] = None
-    redis: Optional[str] = None
-    error: Optional[str] = None
-    http_status: Optional[int] = None
+    conclusion: str
+    evidence: str = ""
+
+
+# 决策只有两种:调工具,或结束
+Decision = Union[ToolCall, Finish]
 
 
 @dataclass
-class ServiceStatus:
-    """Docker 服务的运行状态。
-
-    running : 服务是否在运行
-    raw     : docker compose ps 返回的原始状态(如 running / exited)
-    error   : 查询失败时的错误信息
-    """
-    service: str
-    running: bool
-    raw: str = ""
-    error: Optional[str] = None
-
-
-@dataclass
-class ActionResult:
-    """一次动作(重启服务等)的执行结果。
-
-    ok     : 动作是否成功
-    action : 执行了什么动作(便于打印时看清 Agent 做了什么)
-    output : 命令的标准输出 + 标准错误
-    error  : 失败原因(命令报错、超时、权限拒绝等)
-    """
-    ok: bool
-    action: str
-    output: str = ""
-    error: Optional[str] = None
-
-
-@dataclass
-class LogsResult:
-    """容器日志的查询结果(只用于诊断)。"""
-    ok: bool
-    service: str
-    output: str = ""
-    error: Optional[str] = None
+class HistoryEntry:
+    """循环中一步的完整记录:决策 + 工具结果,可序列化、可回放。"""
+    step: int
+    decision: ToolCall
+    result: Dict[str, object]
